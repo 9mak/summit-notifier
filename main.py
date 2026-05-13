@@ -1,11 +1,36 @@
 import urllib.request
 import urllib.parse
+import urllib.error
 import json
 import re
 import os
 import sys
 import base64
 import subprocess
+import traceback
+
+# 実ブラウザに寄せたUA。短いUAだとtokubai等のCDNで弾かれることがある
+USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+)
+DEFAULT_HEADERS = {
+    "User-Agent": USER_AGENT,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "ja,en;q=0.8",
+}
+
+# Geminiのinline_dataは1リクエスト合計 ~20MB が上限。base64で約4/3に膨らむため
+# 安全のためバイト換算で14MBを上限に枚数を絞る
+MAX_INLINE_BYTES = 14 * 1024 * 1024
+
+
+def _http_get(url, headers=None, timeout=30):
+    merged = dict(DEFAULT_HEADERS)
+    if headers:
+        merged.update(headers)
+    req = urllib.request.Request(url, headers=merged)
+    return urllib.request.urlopen(req, timeout=timeout)
 
 # ==========================================
 # 設定エリア
@@ -25,53 +50,84 @@ def fetch_flyer_images(url):
     print(f"📥 {url} からチラシ情報を取得中...")
     downloaded = []  # [(local_path, original_url), ...]
     try:
-        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-        html = urllib.request.urlopen(req).read().decode('utf-8')
-        
+        html = _http_get(url).read().decode('utf-8')
+
         # leafletページのリンクを1つ取得してアクセス
         leaflet_matches = re.findall(r'href="(/[^/]+/\d+/leaflets/\d+)[^"]*"', html)
         if leaflet_matches:
             leaflet_url = "https://tokubai.co.jp" + leaflet_matches[0]
             print(f"📄 チラシ詳細ページにアクセス中: {leaflet_url}")
-            req_leaf = urllib.request.Request(leaflet_url, headers={'User-Agent': 'Mozilla/5.0'})
-            html_leaf = urllib.request.urlopen(req_leaf).read().decode('utf-8')
+            html_leaf = _http_get(leaflet_url, headers={"Referer": url}).read().decode('utf-8')
         else:
             html_leaf = html
-        
+
         # ページ内のJSONデータから high_resolution_image_url を全て抽出
-        img_urls = re.findall(r'high_resolution_image_url(?:&quot;|")\s*(?::|:\s*)(?:&quot;|")(https://[^"&]+)', html_leaf)
-        
+        img_urls = re.findall(r'high_resolution_image_url(?:&quot;|")\s*:\s*(?:&quot;|")(https?://[^"\\]+)', html_leaf)
+
         # 重複を排除しつつ順序を保持
         seen = set()
         unique_urls = []
         for u in img_urls:
-            u = u.replace('\\u0026', '&')
+            u = u.replace('\\u0026', '&').replace('\\/', '/')
             if u not in seen:
                 seen.add(u)
                 unique_urls.append(u)
-        
+
         print(f"📋 {len(unique_urls)} 枚のチラシ画像が見つかりました。全て取得します。")
-        
+
+        img_headers = {"Referer": "https://tokubai.co.jp/"}
         for i, img_url in enumerate(unique_urls):
             save_path = f"today_flyer_{i}.jpg"
             print(f"🖼️ チラシ {i+1}/{len(unique_urls)}: {img_url[:80]}...")
-            urllib.request.urlretrieve(img_url, save_path)
-            downloaded.append((save_path, img_url))
-            
+            try:
+                with _http_get(img_url, headers=img_headers) as resp, open(save_path, "wb") as f:
+                    f.write(resp.read())
+                downloaded.append((save_path, img_url))
+            except Exception as e:
+                print(f"  ⚠️ チラシ {i+1} ダウンロード失敗: {e}")
+
         print(f"✅ 合計 {len(downloaded)} 枚のチラシ画像を保存しました。")
+        return downloaded
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode('utf-8', errors='replace')[:500]
+        except Exception:
+            pass
+        print(f"❌ 画像取得HTTPエラー: {e.code} {e.reason} body={body}")
+        traceback.print_exc()
         return downloaded
     except Exception as e:
         print(f"❌ 画像取得エラー: {e}")
-        import traceback; traceback.print_exc()
+        traceback.print_exc()
         return downloaded
 
 def analyze_with_gemini(image_paths):
     """複数のチラシ画像をGeminiに投げて、特売情報＋献立提案を抽出する"""
     print(f"🤖 Google Gemini API に {len(image_paths)} 枚の画像を同時に投げて特売情報を抽出中...")
-    
+
     api_key = GEMINI_API_KEY.strip() if GEMINI_API_KEY else ""
     if api_key == "ここにGeminiのAPIキーを入れてください" or not api_key:
-        return "⚠️ エラー: Gemini APIキーが設定されていません。"
+        raise RuntimeError("Gemini APIキーが設定されていません (GEMINI_API_KEY)")
+
+    # inline_data の合計サイズが Gemini の上限を超えると 400 になる。
+    # サイズ順ではなく元の順序を維持しつつ、合計が閾値を超えない枚数だけ送る
+    selected = []
+    total = 0
+    for p in image_paths:
+        try:
+            size = os.path.getsize(p)
+        except OSError:
+            continue
+        if total + size > MAX_INLINE_BYTES and selected:
+            print(f"⚠️ サイズ上限({MAX_INLINE_BYTES//1024//1024}MB)に達したため "
+                  f"{len(image_paths)}枚中{len(selected)}枚のみGeminiに送信します")
+            break
+        selected.append(p)
+        total += size
+    image_paths = selected
+    if not image_paths:
+        raise RuntimeError("Geminiに送信できる画像がありません")
 
     prompt = """あなたはスーパーのチラシを読み取る専門AIです。
 
@@ -161,13 +217,36 @@ def analyze_with_gemini(image_paths):
     req = urllib.request.Request(url, data=json.dumps(data).encode('utf-8'), headers=headers, method="POST")
 
     try:
-        response = urllib.request.urlopen(req)
+        response = urllib.request.urlopen(req, timeout=120)
         result = json.loads(response.read().decode('utf-8'))
-        text = result['candidates'][0]['content']['parts'][0]['text']
-        return text.strip()
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode('utf-8', errors='replace')
+        except Exception:
+            pass
+        print(f"❌ Gemini API HTTPエラー: {e.code} {e.reason}\n--- response body ---\n{body}\n---------------------")
+        raise
     except Exception as e:
         print(f"❌ Gemini API エラー: {e}")
-        return "特売情報の抽出に失敗しました。"
+        traceback.print_exc()
+        raise
+
+    candidates = result.get('candidates') or []
+    if not candidates:
+        feedback = result.get('promptFeedback') or {}
+        print(f"❌ Gemini候補なし: promptFeedback={json.dumps(feedback, ensure_ascii=False)}")
+        print(f"--- full response ---\n{json.dumps(result, ensure_ascii=False)[:2000]}\n---------------------")
+        raise RuntimeError(f"Gemini returned no candidates (finishReason={feedback.get('blockReason', 'unknown')})")
+
+    cand = candidates[0]
+    parts = (cand.get('content') or {}).get('parts') or []
+    text_parts = [p.get('text', '') for p in parts if 'text' in p]
+    if not text_parts:
+        print(f"❌ Gemini候補にtext無し: {json.dumps(cand, ensure_ascii=False)[:1000]}")
+        raise RuntimeError(f"Gemini candidate had no text (finishReason={cand.get('finishReason')})")
+
+    return "".join(text_parts).strip()
 
 def notify_line(message):
     """LINE Messaging APIで友だち全員に特売情報をブロードキャスト送信する"""
@@ -207,24 +286,29 @@ def notify_mac(title, message):
 
 if __name__ == "__main__":
     print("🚀 サミット特売通知ツールを開始します")
-    
+
     # 1. チラシ画像取得（ローカルパスと元URLのペアで返る）
     flyer_data = fetch_flyer_images(STORE_URL)
     if not flyer_data:
+        print("❌ チラシ画像を1枚も取得できませんでした。終了します。")
         sys.exit(1)
-    
+
     local_paths = [d[0] for d in flyer_data]
     original_urls = [d[1] for d in flyer_data]
-        
+
     # 2. Gemini でOCR＋献立提案
-    deals = analyze_with_gemini(local_paths)
-    
+    try:
+        deals = analyze_with_gemini(local_paths)
+    except Exception as e:
+        print(f"❌ Geminiでの解析に失敗したため処理を中断します: {e}")
+        sys.exit(1)
+
     print("\n--- 抽出結果 ---")
     print(deals)
     print("----------------\n")
-    
+
     # 3. 通知（テキスト＋チラシ画像＋リンク）
     notify_mac("サミット 今日の特売！", deals)
     notify_line(deals)
-    
+
     print("🎉 完了しました！")
