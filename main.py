@@ -25,11 +25,24 @@ DEFAULT_HEADERS = {
 MAX_INLINE_BYTES = 14 * 1024 * 1024
 
 
+_URL_SAFE = ":/?#[]@!$&'()*+,;=%~"
+
+
+def _safe_url(u):
+    """URLの path/query/fragment の非ASCII文字をパーセントエンコードして
+    urllib にそのまま渡せる形にする。既にエンコード済みの%は壊さない。"""
+    parts = urllib.parse.urlsplit(u)
+    path = urllib.parse.quote(parts.path, safe=_URL_SAFE)
+    query = urllib.parse.quote(parts.query, safe=_URL_SAFE)
+    fragment = urllib.parse.quote(parts.fragment, safe=_URL_SAFE)
+    return urllib.parse.urlunsplit((parts.scheme, parts.netloc, path, query, fragment))
+
+
 def _http_get(url, headers=None, timeout=30):
     merged = dict(DEFAULT_HEADERS)
     if headers:
         merged.update(headers)
-    req = urllib.request.Request(url, headers=merged)
+    req = urllib.request.Request(_safe_url(url), headers=merged)
     return urllib.request.urlopen(req, timeout=timeout)
 
 # ==========================================
@@ -62,7 +75,8 @@ def fetch_flyer_images(url):
             html_leaf = html
 
         # ページ内のJSONデータから high_resolution_image_url を全て抽出
-        img_urls = re.findall(r'high_resolution_image_url(?:&quot;|")\s*:\s*(?:&quot;|")(https?://[^"\\]+)', html_leaf)
+        # HTML-encodedされたJSON("&quot;...&quot;")ではURL終端が `&` なので negative class に & を含める
+        img_urls = re.findall(r'high_resolution_image_url(?:&quot;|")\s*:\s*(?:&quot;|")(https?://[^"&\\]+)', html_leaf)
 
         # 重複を排除しつつ順序を保持
         seen = set()
